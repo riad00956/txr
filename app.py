@@ -1,240 +1,249 @@
 import os
-import asyncio
-import aiohttp
-import aiosqlite
+import telebot
+import sqlite3
+import requests
 import random
 import string
-import time
+import threading
 from datetime import datetime
-from telebot.async_telebot import AsyncTeleBot
 from telebot import types
-from aiohttp import web
+from apscheduler.schedulers.background import BackgroundScheduler
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==============================
 # CONFIGURATION
 # ==============================
-API_TOKEN = os.getenv("BOT_TOKEN")  # Render Env
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Your Telegram ID
-
-bot = AsyncTeleBot(API_TOKEN)
-DB_NAME = "monitor.db"
-
-# ==============================
-# DATABASE LAYER
-# ==============================
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, is_verified INTEGER DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS access_codes (code TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS monitors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, url TEXT, 
-            interval INTEGER, status TEXT DEFAULT 'UNKNOWN', last_check TEXT, fail_count INTEGER DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, monitor_id INTEGER, status TEXT, timestamp TEXT)''')
-        await db.commit()
+API_TOKEN = '8225162929:AAExD7IKh-jpAXwPCQkLDP6wKgnJhUoKVJ0'
+ADMIN_ID = 7832264582 # আপনার নিজের আইডি এখানে দিন
+bot = telebot.TeleBot(API_TOKEN)
+scheduler = BackgroundScheduler(timezone="Asia/Dhaka")
+scheduler.start()
 
 # ==============================
-# UTILITIES
+# DATABASE SETUP
 # ==============================
-def get_ascii_graph(history):
-    if not history: return "No data yet."
-    # Uptime string: 🟩 for UP, 🟥 for DOWN
-    return "".join(["🟩" if h == 'UP' else "🟥" for h in history[-15:]])
+def init_db():
+    conn = sqlite3.connect('uptime.db', check_same_thread=False)
+    cursor = conn.cursor()
+    # মনিটর টেবিল
+    cursor.execute('''CREATE TABLE IF NOT EXISTS monitors 
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, url TEXT, 
+                       interval INTEGER, status TEXT DEFAULT 'UNKNOWN', fail_count INTEGER DEFAULT 0)''')
+    # ইউজার টেবিল (ভেরিফিকেশনের জন্য)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, is_verified INTEGER DEFAULT 0)''')
+    # এক্সেস কোড টেবিল
+    cursor.execute('''CREATE TABLE IF NOT EXISTS access_codes (code TEXT PRIMARY KEY, is_used INTEGER DEFAULT 0)''')
+    # লগ টেবিল (গ্রাফের জন্য)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, monitor_id INTEGER, status TEXT, timestamp TEXT)''')
+    conn.commit()
+    return conn
 
-async def simulate_ping(url):
-    regions = ["🇺🇸 US-East", "🇪🇺 EU-West", "🇸🇬 SG-Core", "🇯🇵 JP-Tokyo"]
+db_conn = init_db()
+
+# ==============================
+# UTILS & HELPERS
+# ==============================
+def generate_ascii_graph(monitor_id):
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT status FROM logs WHERE monitor_id=? ORDER BY id DESC LIMIT 15", (monitor_id,))
+    rows = cursor.fetchall()
+    if not rows: return "No Data"
+    # উল্টো করে সাজানো (বাম থেকে ডানে সময়)
+    history = [r[0] for r in rows][::-1]
+    return "".join(["🟩" if s == 'UP' else "🟥" for s in history])
+
+def ping_url(monitor_id, url, user_id):
+    regions = ["🇺🇸 US", "🇪🇺 EU", "🇸🇬 SG"]
     region = random.choice(regions)
-    headers = {'User-Agent': 'MonitorBot/2.0 (Render; Cloud)'}
     try:
-        start_time = time.time()
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10, headers=headers) as resp:
-                latency = round((time.time() - start_time) * 1000)
-                if resp.status == 200:
-                    return "UP", f"{region} | {latency}ms | 200 OK"
-                return "DOWN", f"{region} | Status: {resp.status}"
-    except Exception as e:
-        return "DOWN", f"{region} | Timeout/Error"
+        response = requests.get(url, timeout=10)
+        status = "UP" if response.status_code == 200 else "DOWN"
+    except:
+        status = "DOWN"
+
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT fail_count FROM monitors WHERE id=?", (monitor_id,))
+    fail_count = cursor.fetchone()[0]
+
+    now = datetime.now().strftime("%H:%M")
+    
+    # স্মার্ট রিট্রাই লজিক
+    final_status = status
+    new_fail_count = fail_count + 1 if status == "DOWN" else 0
+    
+    if new_fail_count > 0 and new_fail_count < 3:
+        final_status = "UP" # ৩ বার ফেইল না হওয়া পর্যন্ত ইউজারকে UP দেখাবে
+
+    cursor.execute("UPDATE monitors SET status=?, fail_count=? WHERE id=?", (final_status, new_fail_count, monitor_id))
+    cursor.execute("INSERT INTO logs (monitor_id, status, timestamp) VALUES (?, ?, ?)", (monitor_id, status, now))
+    db_conn.commit()
+
+    # অ্যালার্ট পাঠানো (৩য় বার ফেইল হলে)
+    if new_fail_count == 3:
+        bot.send_message(user_id, f"🚨 *ALERT: DOWN*\n\nURL: {url}\nRegion: {region}\nStatus: {status}", parse_mode="Markdown")
 
 # ==============================
-# MONITORING ENGINE (ASYNC)
+# MIDDLEWARE (Access Control)
 # ==============================
-async def monitor_loop():
-    while True:
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT id, user_id, url, interval, fail_count, status FROM monitors") as cursor:
-                all_monitors = await cursor.fetchall()
-
-            for mid, uid, url, interval, fail_count, old_status in all_monitors:
-                # Logic: Check if it's time to ping based on interval (simplified for demo)
-                status, log_msg = await simulate_ping(url)
-                now = datetime.now().strftime("%H:%M:%S")
-
-                new_fail_count = fail_count + 1 if status == "DOWN" else 0
-                final_status = status
-
-                # Smart Retry: Only mark DOWN after 3 failures
-                if status == "DOWN" and new_fail_count < 3:
-                    final_status = "UP"
-
-                await db.execute("UPDATE monitors SET status=?, last_check=?, fail_count=? WHERE id=?", 
-                                (final_status, now, new_fail_count, mid))
-                await db.execute("INSERT INTO logs (monitor_id, status, timestamp) VALUES (?, ?, ?)", 
-                                (mid, status, now))
-                await db.commit()
-
-                # Alert on 3rd failure
-                if new_fail_count == 3:
-                    try:
-                        alert = f"🚨 *MONITOR DOWN*\n\nURL: {url}\nReason: {log_msg}\nTime: {now}"
-                        await bot.send_message(uid, alert, parse_mode="Markdown")
-                    except: pass
-        
-        await asyncio.sleep(60) # Global check cycle
+def is_verified(user_id):
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT is_verified FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    return row and row[0] == 1
 
 # ==============================
-# BOT LOGIC
+# BOT HANDLERS
 # ==============================
+def main_menu():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("➕ লিঙ্ক যোগ করুন", callback_data="add"))
+    markup.add(types.InlineKeyboardButton("📋 আমার লিস্ট", callback_data="list"))
+    return markup
 
 @bot.message_handler(commands=['start'])
-async def start_handler(message):
+def start(message):
     uid = message.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT is_verified FROM users WHERE user_id=?", (uid,)) as cursor:
-            user = await cursor.fetchone()
-            if not user or user[0] == 0:
-                if not user: await db.execute("INSERT INTO users (user_id) VALUES (?)", (uid,))
-                await db.commit()
-                return await bot.send_message(uid, "🔒 *Access Locked*\nEnter Access Code (AC-XXXX):", parse_mode="Markdown")
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("➕ Add", callback_data="add"),
-               types.InlineKeyboardButton("📊 My Sites", callback_data="list"))
-    await bot.send_message(uid, "🚀 *Professional Uptime Monitor*", reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda c: c.data == "list")
-async def list_monitors(call):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT id, url, status FROM monitors WHERE user_id=?", (call.from_user.id,)) as cursor:
-            mons = await cursor.fetchall()
-    
-    markup = types.InlineKeyboardMarkup()
-    for mid, url, status in mons:
-        icon = "🟢" if status == "UP" else "🔴"
-        markup.add(types.InlineKeyboardButton(f"{icon} {url}", callback_data=f"view_{mid}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="home"))
-    await bot.edit_message_text("🔎 *Select Monitor:*", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("view_"))
-async def view_monitor(call):
-    mid = call.data.split("_")[1]
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT url, status, last_check, interval FROM monitors WHERE id=?", (mid,)) as cursor:
-            m = await cursor.fetchone()
-        async with db.execute("SELECT status FROM logs WHERE monitor_id=? ORDER BY id DESC LIMIT 15", (mid,)) as cursor:
-            history = [r[0] for r in await cursor.fetchall()][::-1]
-
-    graph = get_ascii_graph(history)
-    text = (f"🌐 *Monitor:* {m[0]}\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"Status: {'🟢 Online' if m[1]=='UP' else '🔴 Offline'}\n"
-            f"Check Interval: {m[3]}m\n"
-            f"Last Ping: {m[2]}\n\n"
-            f"Uptime Diagram (Last 15):\n`{graph}`")
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.row(types.InlineKeyboardButton("✏ Edit", callback_data=f"edit_{mid}"),
-               types.InlineKeyboardButton("🗑 Delete", callback_data=f"del_{mid}"))
-    markup.add(types.InlineKeyboardButton("🧭 Live Logs", callback_data=f"logs_{mid}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="list"))
-    await bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("logs_"))
-async def live_logs(call):
-    mid = call.data.split("_")[1]
-    # Simple live log display (last 5)
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT status, timestamp FROM logs WHERE monitor_id=? ORDER BY id DESC LIMIT 5", (mid,)) as cursor:
-            logs = await cursor.fetchall()
-    
-    log_text = "🧭 *Live Streaming Logs:*\n\n" + "\n".join([f"`[{l[1]}]` Status: {l[0]}" for l in logs])
-    await bot.answer_callback_query(call.id, "Streaming...")
-    msg = await bot.send_message(call.message.chat.id, log_text, parse_mode="Markdown")
-    
-    await asyncio.sleep(60)
-    try: await bot.delete_message(msg.chat.id, msg.message_id) # Auto delete
-    except: pass
-
-@bot.message_handler(commands=['admin'])
-async def admin_panel(message):
-    if message.from_user.id != ADMIN_ID: return
-    code = f"AC-{''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(6))}"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO access_codes (code) VALUES (?)", (code,))
-        await db.commit()
-    await bot.reply_to(message, f"🔑 *New Access Code Generated:*\n`{code}`", parse_mode="Markdown")
+    if not is_verified(uid):
+        cursor = db_conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        db_conn.commit()
+        bot.send_message(message.chat.id, "🔒 *বটটি লক করা আছে!*\n\nব্যবহার করতে অ্যাডমিনের দেওয়া এক্সেস কোডটি পাঠান (যেমন: AC-XXXXXX)", parse_mode="Markdown")
+        return
+    bot.send_message(message.chat.id, "✅ আপটাইমার বট এখন সচল!", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda m: m.text.startswith("AC-"))
-async def verify_code(message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT code FROM access_codes WHERE code=? AND is_used=0", (message.text,)) as cursor:
-            if await cursor.fetchone():
-                await db.execute("UPDATE access_codes SET is_used=1 WHERE code=?", (message.text,))
-                await db.execute("UPDATE users SET is_verified=1 WHERE user_id=?", (message.from_user.id,))
-                await db.commit()
-                await bot.reply_to(message, "✅ Verification Successful! /start")
-            else:
-                await bot.reply_to(message, "❌ Invalid or Expired Code.")
+def verify_code(message):
+    code = message.text.strip()
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT code FROM access_codes WHERE code=? AND is_used=0", (code,))
+    if cursor.fetchone():
+        cursor.execute("UPDATE access_codes SET is_used=1 WHERE code=?", (code,))
+        cursor.execute("UPDATE users SET is_verified=1 WHERE user_id=?", (message.from_user.id,))
+        db_conn.commit()
+        bot.reply_to(message, "🎉 অভিনন্দন! এক্সেস কোড গ্রহণ করা হয়েছে। এখন /start দিন।")
+    else:
+        bot.reply_to(message, "❌ ভুল বা ব্যবহৃত কোড।")
 
-@bot.callback_query_handler(func=lambda c: c.data == "add")
-async def add_start(call):
-    msg = await bot.send_message(call.message.chat.id, "🔗 Enter URL (including http/https):")
-    bot.register_next_step_handler(msg, save_url)
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID: return
+    code = "AC-" + ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    cursor = db_conn.cursor()
+    cursor.execute("INSERT INTO access_codes (code) VALUES (?)", (code,))
+    db_conn.commit()
+    bot.send_message(ADMIN_ID, f"🔑 *নতুন এক্সেস কোড:* `{code}`", parse_mode="Markdown")
 
-async def save_url(message):
+@bot.callback_query_handler(func=lambda call: call.data == "add")
+def ask_url(call):
+    if not is_verified(call.from_user.id): return
+    sent = bot.edit_message_text("আপনার ইউআরএলটি পাঠান (http/https সহ):", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(sent, process_url_input)
+
+def process_url_input(message):
     url = message.text
-    if not url.startswith("http"): return await bot.reply_to(message, "❌ Invalid URL.")
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO monitors (user_id, url, interval) VALUES (?, ?, ?)", (message.from_user.id, url, 5))
-        await db.commit()
-    await bot.send_message(message.chat.id, "✅ Monitor Active!")
+    if not url.startswith("http"):
+        bot.send_message(message.chat.id, "❌ সঠিক ইউআরএল দিন।")
+        return
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("del_"))
-async def delete_mon(call):
+    cursor = db_conn.cursor()
+    cursor.execute("INSERT INTO monitors (user_id, url, interval) VALUES (?, ?, ?)", (message.from_user.id, url, 0))
+    db_conn.commit()
+    row_id = cursor.lastrowid
+
+    markup = types.InlineKeyboardMarkup()
+    btns = [types.InlineKeyboardButton(f"{m} মিনিট", callback_data=f"save_{m}_{row_id}") for m in [5, 10, 30]]
+    markup.add(*btns)
+    bot.send_message(message.chat.id, "ইউআরএল সেভ হয়েছে। সময় বেছে নিন:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("save_"))
+def finalize_save(call):
+    _, minutes, row_id = call.data.split("_")
+    cursor = db_conn.cursor()
+    cursor.execute("UPDATE monitors SET interval = ? WHERE id = ?", (int(minutes), int(row_id)))
+    cursor.execute("SELECT url FROM monitors WHERE id = ?", (int(row_id),))
+    url = cursor.fetchone()[0]
+    db_conn.commit()
+
+    # শিডিউলার অ্যাড করা
+    scheduler.add_job(ping_url, "interval", minutes=int(minutes), args=[row_id, url, call.from_user.id], id=f"job_{row_id}")
+    
+    bot.edit_message_text(f"✅ সচল হয়েছে!\n\n🌐 {url}\n⏱ {minutes} মিনিট পরপর চেক করা হবে।", 
+                          call.message.chat.id, call.message.message_id, reply_markup=main_menu())
+
+@bot.callback_query_handler(func=lambda call: call.data == "list")
+def show_list(call):
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT id, url, status FROM monitors WHERE user_id=? AND interval > 0", (call.from_user.id,))
+    rows = cursor.fetchall()
+    
+    markup = types.InlineKeyboardMarkup()
+    for r in rows:
+        icon = "🟢" if r[2] == "UP" else "🔴" if r[2] == "DOWN" else "⚪"
+        markup.add(types.InlineKeyboardButton(f"{icon} {r[1]}", callback_data=f"view_{r[0]}"))
+    
+    markup.add(types.InlineKeyboardButton("🔙 ফিরে যান", callback_data="home"))
+    bot.edit_message_text("📊 *আপনার মনিটর লিস্ট:*", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_"))
+def view_monitor(call):
     mid = call.data.split("_")[1]
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM monitors WHERE id=?", (mid,))
-        await db.commit()
-    await bot.answer_callback_query(call.id, "Deleted!")
-    await list_monitors(call)
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT url, interval, status FROM monitors WHERE id=?", (mid,))
+    m = cursor.fetchone()
+    
+    graph = generate_ascii_graph(mid)
+    text = (f"🌐 *URL:* {m[0]}\n"
+            f"⏱ *Interval:* {m[1]} min\n"
+            f"📡 *Status:* {m[2]}\n\n"
+            f"📊 *Uptime Graph (Last 15):*\n`{graph}`")
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🗑 ডিলিট করুন", callback_data=f"del_{mid}"))
+    markup.add(types.InlineKeyboardButton("🔙 লিস্টে ফিরুন", callback_data="list"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-@bot.callback_query_handler(func=lambda c: c.data == "home")
-async def home(call):
-    await start_handler(call.message)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("del_"))
+def delete_monitor(call):
+    mid = call.data.split("_")[1]
+    cursor = db_conn.cursor()
+    cursor.execute("DELETE FROM monitors WHERE id=?", (mid,))
+    cursor.execute("DELETE FROM logs WHERE monitor_id=?", (mid,))
+    db_conn.commit()
+    
+    try: scheduler.remove_job(f"job_{mid}")
+    except: pass
+    
+    bot.answer_callback_query(call.id, "ডিলিট করা হয়েছে।")
+    show_list(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "home")
+def go_home(call):
+    bot.edit_message_text("আপটাইমার বট এখন সচল!", call.message.chat.id, call.message.message_id, reply_markup=main_menu())
 
 # ==============================
-# RENDER HEALTH CHECK
+# RENDER PERSISTENCE & HEALTH CHECK
 # ==============================
-async def handle(request): return web.Response(text="Bot is Alive!")
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is Running")
 
-async def web_server():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
-# ==============================
-# RUNNER
-# ==============================
-async def main():
-    await init_db()
-    asyncio.create_task(web_server())
-    asyncio.create_task(monitor_loop())
-    print("Bot is running...")
-    await bot.polling(non_stop=True)
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    httpd = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    httpd.serve_forever()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # রেন্ডারে পোর্ট সচল রাখতে থ্রেডিং ব্যবহার করা হয়েছে
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # বট রিস্টার্ট হলে ডাটাবেস থেকে সব শিডিউলার পুনরায় চালু করা
+    cursor = db_conn.cursor()
+    cursor.execute("SELECT id, url, interval, user_id FROM monitors WHERE interval > 0")
+    for r in cursor.fetchall():
+        scheduler.add_job(ping_url, "interval", minutes=r[2], args=[r[0], r[1], r[3]], id=f"job_{r[0]}")
+    
+    print("Bot Started...")
+    bot.infinity_polling()
