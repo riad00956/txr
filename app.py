@@ -64,7 +64,7 @@ def ping_url(monitor_id, url, user_id):
     cursor = db_conn.cursor()
     cursor.execute("SELECT fail_count FROM monitors WHERE id=?", (monitor_id,))
     res = cursor.fetchone()
-    if not res: return # Monitor was deleted
+    if not res: return 
     fail_count = res[0]
 
     now = datetime.now().strftime("%H:%M:%S")
@@ -74,7 +74,7 @@ def ping_url(monitor_id, url, user_id):
     new_fail_count = fail_count + 1 if status == "DOWN" else 0
     
     if 0 < new_fail_count < 3:
-        final_status = "UP" # Still show UP until 3 failures
+        final_status = "UP" 
 
     cursor.execute("UPDATE monitors SET status=?, fail_count=? WHERE id=?", (final_status, new_fail_count, monitor_id))
     cursor.execute("INSERT INTO logs (monitor_id, status, detail, timestamp) VALUES (?, ?, ?, ?)", 
@@ -121,7 +121,7 @@ def start(message):
         db_conn.commit()
         return bot.send_message(uid, "🔒 *Access Denied*\nPlease send your Access Code (AC-XXXXX) to unlock:", parse_mode="Markdown")
     
-    bot.send_message(uid, "✅ *Uptime Monitor is Active*", reply_markup=main_menu(), parse_mode="Markdown")
+    bot.send_message(uid, "✅ *Uptime Monitor Dashboard*", reply_markup=main_menu(), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text.startswith("AC-"))
 def verify_code(message):
@@ -147,21 +147,20 @@ def admin_panel(message):
 
 @bot.callback_query_handler(func=lambda call: call.data == "add")
 def ask_url(call):
-    if not is_verified(call.from_user.id): return
     sent = bot.edit_message_text("🔗 Send the URL to monitor (with http/https):", call.message.chat.id, call.message.message_id)
     bot.register_next_step_handler(sent, process_url_input)
 
 def process_url_input(message):
     url = message.text
     if not url.startswith("http"):
-        return bot.send_message(message.chat.id, "❌ Error: URL must start with http or https.")
+        return bot.send_message(message.chat.id, "❌ Error: Invalid URL format.")
     
     cursor = db_conn.cursor()
     cursor.execute("INSERT INTO monitors (user_id, url, interval) VALUES (?, ?, ?)", (message.from_user.id, url, 0))
     db_conn.commit()
     row_id = cursor.lastrowid
     
-    sent = bot.send_message(message.chat.id, "⏱ *Set Interval*\nEnter minutes (e.g. 5, 10, 60):", parse_mode="Markdown")
+    sent = bot.send_message(message.chat.id, "⏱ *Set Custom Interval*\nEnter check frequency in minutes (e.g., 2, 10, 60):", parse_mode="Markdown")
     bot.register_next_step_handler(sent, process_interval_input, row_id, url)
 
 def process_interval_input(message, row_id, url):
@@ -169,14 +168,14 @@ def process_interval_input(message, row_id, url):
         minutes = int(message.text)
         if minutes < 1: raise ValueError
     except:
-        return bot.send_message(message.chat.id, "❌ Invalid number. Try /start again.")
+        return bot.send_message(message.chat.id, "❌ Invalid number. Please start again.")
 
     cursor = db_conn.cursor()
     cursor.execute("UPDATE monitors SET interval = ? WHERE id = ?", (minutes, row_id))
     db_conn.commit()
 
     scheduler.add_job(ping_url, "interval", minutes=minutes, args=[row_id, url, message.from_user.id], id=f"job_{row_id}")
-    bot.send_message(message.chat.id, f"✅ *Monitoring Started*\n🌐 {url}\n⏱ Every {minutes} minutes.", parse_mode="Markdown", reply_markup=main_menu())
+    bot.send_message(message.chat.id, f"✅ *Success!*\nMonitoring `{url}` every {minutes} minutes.", reply_markup=main_menu())
 
 @bot.callback_query_handler(func=lambda call: call.data == "list")
 def show_list(call):
@@ -190,7 +189,7 @@ def show_list(call):
         markup.add(types.InlineKeyboardButton(f"{icon} {r[1]}", callback_data=f"view_{r[0]}"))
     
     markup.add(types.InlineKeyboardButton("🔙 Back Home", callback_data="home"))
-    bot.edit_message_text("📊 *Active Monitors:*", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    bot.edit_message_text("📊 *Monitor List:*", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_"))
 def view_monitor(call):
@@ -201,20 +200,19 @@ def view_monitor(call):
     
     cursor.execute("SELECT detail, timestamp FROM logs WHERE monitor_id=? ORDER BY id DESC LIMIT 5", (mid,))
     logs = cursor.fetchall()
-    log_text = "\n".join([f"`[{l[1]}]` {l[0]}" for l in logs]) if logs else "No logs yet."
+    log_text = "\n".join([f"`[{l[1]}]` {l[0]}" for l in logs]) if logs else "No data."
     
     graph = get_ascii_graph(mid)
     text = (f"🌐 *Monitor:* {m[0]}\n"
-            f"⏱ *Interval:* Every {m[1]} min\n"
-            f"📡 *Current Status:* {m[2]}\n\n"
-            f"📊 *Uptime Graph (Last 20):*\n`{graph}`\n\n"
-            f"🧭 *Live Streaming Logs:*\n{log_text}")
+            f"⏱ *Check Rate:* {m[1]} min\n"
+            f"📡 *Current:* {m[2]}\n\n"
+            f"📈 *Uptime Graph (Last 20):*\n`{graph}`\n\n"
+            f"🧭 *Live Regional Logs:*\n{log_text}")
     
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("🔄 Refresh", callback_data=f"view_{mid}"),
                types.InlineKeyboardButton("🗑 Delete", callback_data=f"del_{mid}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back to List", callback_data="list"))
-    
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="list"))
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("del_"))
@@ -224,11 +222,9 @@ def delete_monitor(call):
     cursor.execute("DELETE FROM monitors WHERE id=?", (mid,))
     cursor.execute("DELETE FROM logs WHERE monitor_id=?", (mid,))
     db_conn.commit()
-    
     try: scheduler.remove_job(f"job_{mid}")
     except: pass
-    
-    bot.answer_callback_query(call.id, "Monitor Deleted.")
+    bot.answer_callback_query(call.id, "Deleted.")
     show_list(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "home")
@@ -236,7 +232,7 @@ def go_home(call):
     bot.edit_message_text("✅ *Uptime Monitor Dashboard*", call.message.chat.id, call.message.message_id, reply_markup=main_menu(), parse_mode="Markdown")
 
 # ==============================
-# RENDER SERVER & FIXES
+# RENDER FIX & SERVER
 # ==============================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -246,22 +242,21 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
-    httpd = HTTPServer(('0.0.0.0', port), HealthHandler)
-    httpd.serve_forever()
+    HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     
-    # Reload monitors from DB on restart
     cursor = db_conn.cursor()
     cursor.execute("SELECT id, url, interval, user_id FROM monitors WHERE interval > 0")
     for r in cursor.fetchall():
         try: scheduler.add_job(ping_url, "interval", minutes=r[2], args=[r[0], r[1], r[3]], id=f"job_{r[0]}")
         except: pass
 
-    # --- THE CONFLICT (409) FIX ---
-    bot.remove_webhook(drop_pending_updates=True)
-    time.sleep(1) # Small delay to ensure Telegram sync
+    # --- FIXED CONFLICT (409) ERR ---
+    # delete_webhook handles drop_pending_updates correctly in newer versions
+    bot.delete_webhook(drop_pending_updates=True)
+    time.sleep(1)
     
-    print("Bot is alive...")
+    print("Bot is starting...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
