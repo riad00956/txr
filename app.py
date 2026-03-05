@@ -15,8 +15,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # CONFIGURATION
 # ==============================
 # Replace with your actual Token and Admin ID
-API_TOKEN = '8225162929:AAExD7IKh-jpAXwPCQkLDP6wKgnJhUoKVJ0'
-ADMIN_ID = 7832264582
+API_TOKEN = '8660919886:AAGLJAactunzCrv-lKRO1o-GjiBgLDGEbxI'
+ADMIN_ID = 8373846582
 
 bot = telebot.TeleBot(API_TOKEN)
 scheduler = BackgroundScheduler(timezone="UTC")
@@ -43,7 +43,7 @@ db_conn = init_db()
 # MONITORING ENGINE
 # ==============================
 def ping_url(monitor_id, url, user_id):
-    regions = ["🇺🇸 US-East", "🇪🇺 EU-West", "🇸🇬 SG-Core", "🇯🇵 JP-Tokyo"]
+    regions = ["🇺🇸 US-East", "🇪🇺 EU-West", "🇸🇬 SG-Core", "🇯🇵 JP-Tokyo", "🇧🇩 BD-Khulna", "🇰🇷 KA-North"]
     region = random.choice(regions)
     headers = {'User-Agent': 'UptimeBot/2.0 (Health-Check)'}
     
@@ -121,7 +121,7 @@ def start(message):
         db_conn.commit()
         return bot.send_message(uid, "🔒 *Access Denied*\nPlease send your Access Code (AC-XXXXX) to unlock:", parse_mode="Markdown")
     
-    bot.send_message(uid, "✅ *Uptime Monitor Dashboard*", reply_markup=main_menu(), parse_mode="Markdown")
+    bot.send_message(uid, "✅ *Uptime Monitor Dashboard*\n\n 🎗️chain: @nahin_x_bot", reply_markup=main_menu(), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text.startswith("AC-"))
 def verify_code(message):
@@ -185,7 +185,7 @@ def show_list(call):
     
     markup = types.InlineKeyboardMarkup()
     for r in rows:
-        icon = "🟢" if r[2] == "UP" else "🔴" if r[2] == "DOWN" else "⚪"
+        icon = "💚" if r[2] == "UP" else "❤️" if r[2] == "DOWN" else "⚪"
         markup.add(types.InlineKeyboardButton(f"{icon} {r[1]}", callback_data=f"view_{r[0]}"))
     
     markup.add(types.InlineKeyboardButton("🔙 Back Home", callback_data="home"))
